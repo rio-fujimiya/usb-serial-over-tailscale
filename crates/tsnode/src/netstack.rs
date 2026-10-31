@@ -19,6 +19,9 @@ const USER_TX_LIMIT: usize = 32 * 1024;
 /// Bytes buffered for a reader that is not keeping up; beyond this the
 /// stack stops draining the socket and TCP flow control holds the sender.
 const USER_RX_LIMIT: usize = 16 * 1024;
+const MAX_CONNECTIONS: usize = 12;
+const MAX_PENDING_ACCEPTS: usize = 8;
+const MAX_INBOUND_BYTES: usize = 64 * 1024;
 /// A peer that stops acknowledging (sleeping laptop, vanished NAT mapping)
 /// is dropped after this long so the bridge becomes free again.
 const DEAD_PEER_TIMEOUT: Duration = Duration::from_secs(120);
@@ -172,7 +175,9 @@ impl NetStack {
     /// Delivers an IP packet received from a peer.
     pub fn inject(&self, pkt: Vec<u8>) {
         let mut st = self.inner.state.lock().unwrap();
-        if st.inbound.len() < 256 {
+        let queued: usize = st.inbound.iter().map(Vec::len).sum();
+        if st.inbound.len() < 64 && pkt.len() <= MAX_INBOUND_BYTES.saturating_sub(queued)
+            && st.inbound.try_reserve(1).is_ok() {
             st.inbound.push_back(pkt);
         }
         st.wake = true;
@@ -302,6 +307,12 @@ impl TcpStream {
 
     /// Queues `data` for sending; blocks while the send queue is full.
     pub fn write_all(&self, data: &[u8]) -> io::Result<()> {
+        self.write_all_timeout(data, DEAD_PEER_TIMEOUT)
+    }
+
+    /// Bounded writes let a live media producer release a stalled viewer.
+    pub fn write_all_timeout(&self, data: &[u8], timeout: Duration) -> io::Result<()> {
+        let deadline = Instant::now() + timeout;
         let mut st = self.shared.m.lock().unwrap();
         let mut offset = 0;
         while offset < data.len() {
@@ -313,6 +324,9 @@ impl TcpStream {
             }
             let room = USER_TX_LIMIT.saturating_sub(st.tx.len());
             if room == 0 {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "write timeout"));
+                }
                 st = self
                     .shared
                     .cv
@@ -322,6 +336,7 @@ impl TcpStream {
                 continue;
             }
             let n = room.min(data.len() - offset);
+            st.tx.try_reserve(n).map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "TCP send buffer allocation failed"))?;
             st.tx.extend(&data[offset..offset + n]);
             offset += n;
             drop(st);
@@ -338,7 +353,10 @@ impl TcpStream {
 
     /// Graceful close after pending data is sent.
     pub fn close(&self) {
-        self.shared.m.lock().unwrap().local_closed = true;
+        let mut st = self.shared.m.lock().unwrap();
+        st.local_closed = true;
+        st.rx = VecDeque::new();
+        drop(st);
         self.stack.wake();
     }
 
@@ -346,6 +364,8 @@ impl TcpStream {
         let mut st = self.shared.m.lock().unwrap();
         st.aborted = true;
         st.local_closed = true;
+        st.rx = VecDeque::new();
+        st.tx = VecDeque::new();
         drop(st);
         self.stack.wake();
     }
@@ -447,6 +467,11 @@ fn poll_loop(inner: Arc<Inner>, outbound: Box<dyn Fn(Vec<u8>) + Send + Sync>) {
             let connects = std::mem::take(&mut st.new_connects);
             drop(st);
             for (remote, shared) in connects {
+                if conns.len() >= MAX_CONNECTIONS {
+                    shared.m.lock().unwrap().dead = true;
+                    shared.cv.notify_all();
+                    continue;
+                }
                 let mut s = new_tcp_socket();
                 let local_port =
                     49152 + (u16::from_le_bytes(crate::crypto::random_array()) % 16000);
@@ -495,6 +520,11 @@ fn poll_loop(inner: Arc<Inner>, outbound: Box<dyn Fn(Vec<u8>) + Send + Sync>) {
                     });
                 }
                 _ => {
+                    if conns.len() >= MAX_CONNECTIONS || listeners[i].shared.queue.lock().unwrap().len() >= MAX_PENDING_ACCEPTS {
+                        sock.abort();
+                        i += 1;
+                        continue;
+                    }
                     let remote = sock
                         .remote_endpoint()
                         .map(endpoint_to_std)
@@ -538,9 +568,15 @@ fn poll_loop(inner: Arc<Inner>, outbound: Box<dyn Fn(Vec<u8>) + Send + Sync>) {
             let mut st = shared.m.lock().unwrap();
             let mut changed = false;
             let mut buf = [0u8; 1024];
-            while sock.can_recv() && st.rx.len() < USER_RX_LIMIT {
-                match sock.recv_slice(&mut buf) {
+            while !st.local_closed && sock.can_recv() && st.rx.len() < USER_RX_LIMIT {
+                let wanted = (USER_RX_LIMIT - st.rx.len()).min(buf.len());
+                match sock.recv_slice(&mut buf[..wanted]) {
                     Ok(n) if n > 0 => {
+                        if st.rx.try_reserve(n).is_err() {
+                            st.aborted = true;
+                            changed = true;
+                            break;
+                        }
                         st.rx.extend(&buf[..n]);
                         changed = true;
                     }
@@ -606,6 +642,40 @@ fn poll_loop(inner: Arc<Inner>, outbound: Box<dyn Fn(Vec<u8>) + Send + Sync>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn unpolled_stack() -> NetStack {
+        NetStack { inner: Arc::new(Inner { state: Mutex::new(State {
+            inbound: VecDeque::new(), addrs: Vec::new(), addrs_dirty: false,
+            new_listeners: Vec::new(), new_connects: Vec::new(), shutdown: false, wake: false,
+        }), cv: Condvar::new() }) }
+    }
+    #[test]
+    fn input_queue_is_bounded_by_bytes_and_abort_releases_both_buffers() {
+        let stack = unpolled_stack();
+        for _ in 0..100 { stack.inject(vec![0; 2048]); }
+        let bytes: usize = stack.inner.state.lock().unwrap().inbound.iter().map(Vec::len).sum();
+        assert_eq!(bytes, MAX_INBOUND_BYTES);
+        let shared = Arc::new(ConnShared { m: Mutex::new(ConnState::new("127.0.0.1:80".parse().unwrap())), cv: Condvar::new() });
+        { let mut st = shared.m.lock().unwrap(); st.rx.extend(vec![0; USER_RX_LIMIT]); st.tx.extend(vec![0; USER_TX_LIMIT]); }
+        let stream = TcpStream { shared: shared.clone(), stack };
+        stream.abort();
+        let st = shared.m.lock().unwrap();
+        assert_eq!(st.rx.capacity(), 0);
+        assert_eq!(st.tx.capacity(), 0);
+        assert!(st.local_closed && st.aborted);
+    }
+
+    #[test]
+    fn timed_write_to_unreachable_peer() {
+        let stack = NetStack::start(Box::new(|_| ()), 256 * 1024, &crate::net::std_spawner()).unwrap();
+        stack.set_addresses(vec![("100.64.0.1".parse().unwrap(), 10)]);
+        let connection = stack.connect("100.64.0.2:80".parse().unwrap());
+        let started = Instant::now();
+        let error = connection.write_all_timeout(&vec![0; 100_000], Duration::from_millis(100)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        connection.abort();
+        stack.shutdown();
+    }
 
     /// Two stacks wired back to back: whatever A sends, B receives and vice versa.
     #[test]

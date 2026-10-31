@@ -37,6 +37,7 @@ type Frame = (u8, u8, u32, Vec<u8>);
 const MAX_FRAME_SIZE: usize = 16_384;
 /// Cap on a stream's accumulated header block (HEADERS + CONTINUATION).
 const MAX_HEADER_BLOCK: usize = 64 * 1024;
+const MAX_BUFFERED_BODY: usize = 512 * 1024;
 
 const DEFAULT_WINDOW: u32 = 65_535;
 /// Window we advertise per stream and add to the connection.
@@ -396,6 +397,10 @@ impl H2Conn {
                 let data = strip_padding(&payload, flags & FLAG_PADDED != 0)?;
                 let len = payload.len() as u32;
                 if let Some(s) = self.streams.get_mut(&sid) {
+                    if data.len() > MAX_BUFFERED_BODY.saturating_sub(s.body.len()) {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, "h2 buffered body too large"));
+                    }
+                    s.body.try_reserve(data.len()).map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "h2 body allocation failed"))?;
                     s.body.extend_from_slice(data);
                     if flags & FLAG_END_STREAM != 0 {
                         s.end_stream = true;
@@ -418,7 +423,11 @@ impl H2Conn {
                 }
                 let end_stream = flags & FLAG_END_STREAM != 0;
                 let end_headers = flags & FLAG_END_HEADERS != 0;
-                let s = self.streams.entry(sid).or_default();
+                let s = self.streams.get_mut(&sid).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unsolicited h2 stream"))?;
+                if block.len() > MAX_HEADER_BLOCK.saturating_sub(s.header_block.len()) {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "h2 header block too large"));
+                }
+                s.header_block.try_reserve(block.len()).map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "h2 header allocation failed"))?;
                 s.header_block.extend_from_slice(block);
                 if end_stream {
                     s.end_stream = true;
@@ -428,7 +437,11 @@ impl H2Conn {
                 }
             }
             FRAME_CONTINUATION => {
-                let s = self.streams.entry(sid).or_default();
+                let s = self.streams.get_mut(&sid).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unsolicited h2 continuation"))?;
+                if payload.len() > MAX_HEADER_BLOCK.saturating_sub(s.header_block.len()) {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "h2 header block too large"));
+                }
+                s.header_block.try_reserve(payload.len()).map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "h2 header allocation failed"))?;
                 s.header_block.extend_from_slice(&payload);
                 if flags & FLAG_END_HEADERS != 0 {
                     self.finish_headers(sid)?;
@@ -616,4 +629,28 @@ fn push_frame(out: &mut Vec<u8>, typ: u8, flags: u8, sid: u32, payload: &[u8]) {
     out.push(flags);
     out.extend_from_slice(&sid.to_be_bytes());
     out.extend_from_slice(payload);
+}
+
+#[cfg(test)]
+mod memory_tests {
+    use super::*;
+    struct Sink;
+    impl std::io::Read for Sink { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { Ok(0) } }
+    impl std::io::Write for Sink {
+        fn write(&mut self, data: &[u8]) -> io::Result<usize> { Ok(data.len()) }
+        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    }
+    impl Conn for Sink { fn set_read_timeout(&mut self, _: Option<Duration>) -> io::Result<()> { Ok(()) } }
+    #[test]
+    fn segmented_headers_bodies_and_unsolicited_streams_cannot_grow_without_bound() {
+        let mut h2 = H2Conn::new(Box::new(Sink), "localhost").unwrap();
+        h2.streams.entry(1).or_default().header_block = vec![0; MAX_HEADER_BLOCK];
+        assert!(h2.handle_frame(FRAME_CONTINUATION, 0, 1, vec![0]).is_err());
+        assert_eq!(h2.streams[&1].header_block.len(), MAX_HEADER_BLOCK);
+        assert!(h2.handle_frame(FRAME_HEADERS, 0, 3, vec![0]).is_err());
+        assert_eq!(h2.streams.len(), 1);
+        h2.streams.get_mut(&1).unwrap().body = vec![0; MAX_BUFFERED_BODY];
+        assert!(h2.handle_frame(FRAME_DATA, 0, 1, vec![0]).is_err());
+        assert_eq!(h2.streams[&1].body.len(), MAX_BUFFERED_BODY);
+    }
 }

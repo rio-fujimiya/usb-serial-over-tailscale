@@ -16,6 +16,10 @@ use std::time::Duration;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// The map stream sends keep-alives roughly every minute; give it slack.
 const MAP_STREAM_TIMEOUT: Duration = Duration::from_secs(150);
+#[cfg(target_os = "espidf")]
+const MAX_MAP_MESSAGE: usize = 512 * 1024;
+#[cfg(not(target_os = "espidf"))]
+const MAX_MAP_MESSAGE: usize = 8 << 20;
 
 #[derive(Debug, Clone)]
 pub struct ControlUrl {
@@ -274,7 +278,13 @@ impl MapStream {
                 return Ok(None);
             }
             match self.h2.read_body(self.id, timeout)? {
-                Some(chunk) => self.buf.extend_from_slice(&chunk),
+                Some(chunk) => {
+                    if chunk.len() > (MAX_MAP_MESSAGE + 4 + 16384).saturating_sub(self.buf.len()) {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, "map buffer too large"));
+                    }
+                    self.buf.try_reserve(chunk.len()).map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "map allocation failed"))?;
+                    self.buf.extend_from_slice(&chunk);
+                }
                 None => self.done = true,
             }
         }
@@ -289,7 +299,7 @@ impl MapStream {
             return Ok(None);
         }
         let len = u32::from_le_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]]) as usize;
-        if len > 8 << 20 {
+        if len > MAX_MAP_MESSAGE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "map message too large",
@@ -300,6 +310,7 @@ impl MapStream {
         }
         let msg = decode_map(&self.buf[4..4 + len])?;
         self.buf.drain(..4 + len);
+        if self.buf.is_empty() && self.buf.capacity() > 64 * 1024 { self.buf = Vec::new(); }
         Ok(Some(msg))
     }
 }
